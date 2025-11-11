@@ -9,6 +9,9 @@ from aws_cdk import (
     aws_apigateway as apigw_,
     aws_ec2 as ec2,
     aws_iam as iam,
+    aws_logs as logs,
+    aws_cloudtrail as cloudtrail,
+    aws_s3 as s3,
     Duration,
 )
 from constructs import Construct
@@ -19,6 +22,25 @@ TABLE_NAME = "demo_table"
 class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
     def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
         super().__init__(scope, construct_id, **kwargs)
+
+        # CloudTrail S3 bucket for audit logs
+        cloudtrail_bucket = s3.Bucket(
+            self,
+            "CloudTrailBucket",
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+        )
+
+        # Configure CloudTrail for API activity logging
+        trail = cloudtrail.Trail(
+            self,
+            "ApiTrail",
+            bucket=cloudtrail_bucket,
+            is_logging=True,
+            include_global_service_events=True,
+            is_multi_region_trail=True,
+            enable_file_validation=True,
+        )
 
         # VPC
         vpc = ec2.Vpc(
@@ -31,6 +53,19 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
                     cidr_mask=24
                 )
             ],
+        )
+
+        # VPC Flow Logs configuration
+        flow_log_group = logs.LogGroup(
+            self,
+            "VpcFlowLogGroup",
+            retention=logs.RetentionDays.ONE_MONTH,
+        )
+
+        vpc.add_flow_log(
+            "FlowLog",
+            destination=ec2.FlowLogDestination.to_cloud_watch_logs(flow_log_group),
+            traffic_type=ec2.FlowLogTrafficType.ALL,
         )
         
         # Create VPC endpoint
@@ -88,12 +123,21 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
         demo_table.grant_write_data(api_hanlder)
         api_hanlder.add_environment("TABLE_NAME", demo_table.table_name)
 
-        # Create API Gateway with X-Ray tracing enabled
+        # API Gateway access logs configuration
+        api_log_group = logs.LogGroup(
+            self,
+            "ApiGatewayAccessLogs",
+            retention=logs.RetentionDays.ONE_MONTH,
+        )
+
+        # Create API Gateway with comprehensive logging and tracing
         apigw_.LambdaRestApi(
             self,
             "Endpoint",
             handler=api_hanlder,
             deploy_options=apigw_.StageOptions(
+                access_log_destination=apigw_.LogGroupLogDestination(api_log_group),
+                access_log_format=apigw_.AccessLogFormat.json_with_standard_fields(),
                 tracing_enabled=True,  # Enable X-Ray tracing
             ),
         )
