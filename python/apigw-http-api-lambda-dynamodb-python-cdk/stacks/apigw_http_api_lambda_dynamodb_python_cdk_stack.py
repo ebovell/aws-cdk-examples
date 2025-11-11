@@ -12,6 +12,7 @@ from aws_cdk import (
     aws_logs as logs,
     aws_cloudtrail as cloudtrail,
     aws_s3 as s3,
+    aws_wafv2 as wafv2,
     Duration,
 )
 from constructs import Construct
@@ -102,7 +103,7 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             ),
         )
 
-        # Create the Lambda function to receive the request
+        # Create the Lambda function with reserved concurrency (REL05-BP02)
         api_hanlder = lambda_.Function(
             self,
             "ApiHandler",
@@ -117,6 +118,7 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             memory_size=1024,
             timeout=Duration.minutes(5),
             tracing=lambda_.Tracing.ACTIVE,  # Enable X-Ray tracing
+            reserved_concurrent_executions=100,  # REL05-BP02: Control Lambda concurrency
         )
 
         # grant permission to lambda to write to demo table
@@ -130,8 +132,8 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
             retention=logs.RetentionDays.ONE_MONTH,
         )
 
-        # Create API Gateway with comprehensive logging and tracing
-        apigw_.LambdaRestApi(
+        # Create API Gateway with throttling configuration (REL05-BP02)
+        api = apigw_.LambdaRestApi(
             self,
             "Endpoint",
             handler=api_hanlder,
@@ -139,5 +141,79 @@ class ApigwHttpApiLambdaDynamodbPythonCdkStack(Stack):
                 access_log_destination=apigw_.LogGroupLogDestination(api_log_group),
                 access_log_format=apigw_.AccessLogFormat.json_with_standard_fields(),
                 tracing_enabled=True,  # Enable X-Ray tracing
+                # REL05-BP02: Configure throttling limits
+                throttle_rate_limit=1000,  # Requests per second
+                throttle_burst_limit=2000,  # Burst capacity
             ),
+        )
+
+        # REL05-BP02: Create API Key for controlled access
+        api_key = apigw_.ApiKey(
+            self,
+            "ApiKey",
+            description="API key for controlled access to the demo API"
+        )
+
+        # REL05-BP02: Create Usage Plan with per-client throttling
+        usage_plan = apigw_.UsagePlan(
+            self,
+            "UsagePlan",
+            name="StandardUsagePlan",
+            description="Standard usage plan with throttling and quota limits",
+            throttle=apigw_.ThrottleSettings(
+                rate_limit=500,  # Per-client rate limit (requests per second)
+                burst_limit=1000  # Per-client burst limit
+            ),
+            quota=apigw_.QuotaSettings(
+                limit=10000,  # Daily quota
+                period=apigw_.Period.DAY
+            )
+        )
+
+        # Associate API key with usage plan
+        usage_plan.add_api_key(api_key)
+        usage_plan.add_api_stage(
+            stage=api.deployment_stage,
+            api=api
+        )
+
+        # REL05-BP02: Create WAF Web ACL with rate-based rules
+        web_acl = wafv2.CfnWebACL(
+            self,
+            "ApiWAF",
+            scope="REGIONAL",
+            default_action=wafv2.CfnWebACL.DefaultActionProperty(allow={}),
+            rules=[
+                wafv2.CfnWebACL.RuleProperty(
+                    name="RateLimitRule",
+                    priority=1,
+                    statement=wafv2.CfnWebACL.StatementProperty(
+                        rate_based_statement=wafv2.CfnWebACL.RateBasedStatementProperty(
+                            limit=2000,  # Requests per 5-minute window per IP
+                            aggregate_key_type="IP"
+                        )
+                    ),
+                    action=wafv2.CfnWebACL.RuleActionProperty(
+                        block={}
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        sampled_requests_enabled=True,
+                        cloud_watch_metrics_enabled=True,
+                        metric_name="RateLimitRule"
+                    )
+                )
+            ],
+            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                sampled_requests_enabled=True,
+                cloud_watch_metrics_enabled=True,
+                metric_name="ApiWAF"
+            )
+        )
+
+        # Associate WAF with API Gateway stage
+        wafv2.CfnWebACLAssociation(
+            self,
+            "WAFAssociation",
+            resource_arn=f"arn:aws:apigateway:{self.region}::/restapis/{api.rest_api_id}/stages/{api.deployment_stage.stage_name}",
+            web_acl_arn=web_acl.attr_arn
         )
